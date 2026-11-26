@@ -59,66 +59,51 @@ def make_exact_exceedance(tau, mu_min, mu_max, k_shape, theta_scale):
 
 
 # ---------------------------------------------------------------------------
-# Monte Carlo à travers le méta-modèle (TODO Partie 3)
+# Monte Carlo à travers le méta-modèle 
 # ---------------------------------------------------------------------------
 def mc_exceedance(gpr, decoder, tau, n_samples, mu_min, mu_max,
-                  k_shape, theta_scale, seed=42):
+                  k_shape, theta_scale, seed=42, batch_size=2000):
     """Estime p_hat(x, tau) = (1/L) sum_l 1{ y_hat_l(x) >= tau } par MC.
-
-    Parameters
-    ----------
-    gpr : GPR ajusté ; gpr.predict(X) -> codes latents z (L, d)
-    decoder : appelable ; decoder(z) -> courbes (L, M)
-              (adapter selon votre backend PCA / AE)
-    tau : seuil (> 0)
-    n_samples : nombre de tirages L
-    mu_min, mu_max, k_shape, theta_scale : loi d'entrée (cf. sujet)
-    seed : graine pour la reproductibilité
 
     Returns
     -------
     p_hat : array (M,), profil de probabilité de dépassement
-    X_mc : array (L, 2), paramètres tirés (mu, sigma^2)
-           -> à conserver pour le contrôle « vrai simulateur » de Q3.2
+    X_mc : array (L, 2), paramètres tirés (mu, sigma^2), pour le contrôle de Q3.2
     """
     rng = np.random.default_rng(seed)
-    # TODO 3.1 :
-    #   1. tirer L paramètres (mu, sigma^2) sous la loi d'entrée :
-    #         mu      = rng.uniform(mu_min, mu_max, size=n_samples)
-    #         sigma2  = rng.gamma(shape=k_shape, scale=theta_scale,
-    #                             size=n_samples)
-    #   2. construire X = np.column_stack([mu, sigma2])
-    #   3. prédire les codes latents : Z = gpr.predict(X)         # (L, d)
-    #   4. décoder : Y_hat = decoder(Z)                            # (L, M)
-    #   5. moyenner les indicateurs : p_hat = (Y_hat >= tau).mean(axis=0)
-    #   6. renvoyer (p_hat, X)
-    raise NotImplementedError
+    # 1. tirage des L paramètres sous la loi d'entrée
+    mu = rng.uniform(mu_min, mu_max, size=n_samples)
+    sigma2 = rng.gamma(shape=k_shape, scale=theta_scale, size=n_samples)
+    # 2. tableau des entrées
+    X = np.column_stack([mu, sigma2])
+    # 3 à 5. GPR -> codes, décodeur -> courbes, comptage (par paquets, pour la mémoire)
+    count = 0
+    for start in range(0, n_samples, batch_size):
+        Z = gpr.predict(X[start:start + batch_size])
+        Y_hat = np.asarray(decoder(Z))
+        count = count + (Y_hat >= tau).sum(axis=0)
+    p_hat = count / n_samples
+    # 6.
+    return p_hat, X
 
 
-def mc_exceedance_true_simulator(x_grid, tau, X_mc, gaussian_pdf):
-    """Contrôle : probabilité empirique sur le VRAI simulateur.
-
-    Utilise les MÊMES tirages X_mc que `mc_exceedance` afin d'isoler le
-    bruit de Monte Carlo (commun aux deux estimateurs) de l'erreur
-    propre au méta-modèle (question Q3.2).
-
-    Parameters
-    ----------
-    x_grid : array (M,), abscisses sur lesquelles évaluer
-    tau : seuil
-    X_mc : array (L, 2), tirages (mu, sigma^2) issus de `mc_exceedance`
-    gaussian_pdf : callable (x_grid, mu, sigma2) -> courbe (M,)
-                   (fonction `gaussian_pdf` fournie dans src/data.py)
+def mc_exceedance_true_simulator(x_grid, tau, X_mc, gaussian_pdf, batch_size=2000):
+    """Contrôle : probabilité empirique sur le VRAI simulateur, avec les MÊMES
+    tirages X_mc que mc_exceedance (isole l'erreur propre au méta-modèle, Q3.2).
 
     Returns
     -------
-    p_true : array (M,), probabilité empirique sur le vrai simulateur
+    p_true : array (M,)
     """
-    # TODO 3.2 :
-    #   Y_true = np.stack([gaussian_pdf(x_grid, mu, s2) for mu, s2 in X_mc])
-    #   p_true = (Y_true >= tau).mean(axis=0)
-    #   return p_true
-    raise NotImplementedError
+    X_mc = np.asarray(X_mc, dtype=float)
+    x_grid = np.asarray(x_grid, dtype=float)
+    count = 0
+    for start in range(0, len(X_mc), batch_size):
+        mu = X_mc[start:start + batch_size, 0][:, None]        # (b, 1)
+        sigma2 = X_mc[start:start + batch_size, 1][:, None]    # (b, 1)
+        Y_true = gaussian_pdf(x_grid[None, :], mu, sigma2)     # (b, M) : b courbes d'un coup
+        count = count + (Y_true >= tau).sum(axis=0)
+    return count / len(X_mc)
 
 
 def area_error(p_hat, p_ref, x_grid):
@@ -129,9 +114,36 @@ def area_error(p_hat, p_ref, x_grid):
     l1 : float, erreur L1 (intégrée sur x_grid)
     linf : float, erreur max_{x in x_grid} |p_hat(x) - p_ref(x)|
     """
-    # TODO 3.1 :
-    #   diff = np.abs(p_hat - p_ref)
-    #   l1   = np.trapezoid(diff, x_grid)       # np.trapz si numpy < 2.0
-    #   linf = diff.max()
-    #   return l1, linf
-    raise NotImplementedError
+    diff = np.abs(np.asarray(p_hat) - np.asarray(p_ref))
+    trapz = getattr(np, 'trapezoid', None) or np.trapz      # np.trapz si numpy < 2.0
+    l1 = float(trapz(diff, x_grid))
+    linf = float(diff.max())
+    return l1, linf
+
+
+def exceedance_metrics(p_hat, p_ref, x_grid):
+    """Erreur L1, erreur max, position de l'erreur max et corrélation, dans un dict."""
+    l1, linf = area_error(p_hat, p_ref, x_grid)
+    diff = np.abs(np.asarray(p_hat) - np.asarray(p_ref))
+    return {'erreur L1 (aire)': l1,
+            'erreur max': linf,
+            'x de l\'erreur max': float(np.asarray(x_grid)[diff.argmax()]),
+            'corrélation': float(np.corrcoef(p_hat, p_ref)[0, 1])}
+    
+    
+def mc_error_study(gpr, decoder, x_grid, p_exact, tau, L_values, n_repeats,
+                   mu_min, mu_max, k_shape, theta_scale, gaussian_pdf, seed0=0):
+    """Q3.2 : pour chaque L et chaque répétition (graine différente), erreurs en aire
+    'bruit MC' (vrai simulateur vs E), 'erreur méta-modèle' (méta-modèle vs vrai
+    simulateur, mêmes tirages) et 'erreur totale' (méta-modèle vs E)."""
+    records = []
+    for L in L_values:
+        for r in range(n_repeats):
+            p_hat, X_mc = mc_exceedance(gpr, decoder, tau, L, mu_min, mu_max,
+                                        k_shape, theta_scale, seed=seed0 + r)
+            p_true = mc_exceedance_true_simulator(x_grid, tau, X_mc, gaussian_pdf)
+            records.append({'L': L, 'répétition': r,
+                            'bruit MC': area_error(p_true, p_exact, x_grid)[0],
+                            'erreur méta-modèle': area_error(p_hat, p_true, x_grid)[0],
+                            'erreur totale': area_error(p_hat, p_exact, x_grid)[0]})
+    return records

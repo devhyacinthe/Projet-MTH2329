@@ -12,10 +12,12 @@ Choix de modélisation :
     scikit-learn le permet, avec des bornes qui empêchent leur effondrement.
 """
 import time
+import warnings
 
 import numpy as np
 from scipy.stats import wilcoxon
 from sklearn.base import clone
+from sklearn.exceptions import ConvergenceWarning
 from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import (
     RBF, Matern, RationalQuadratic, ConstantKernel as C, WhiteKernel,
@@ -78,7 +80,15 @@ def fit_gpr(X_train, Z_train, kernel_name="RBF", n_restarts=3, alpha=1e-5,
     gpr = cls(kernel=kern, alpha=alpha, n_restarts_optimizer=n_restarts,
               normalize_y=True, random_state=seed)
     t0 = time.perf_counter()
-    gpr.fit(X_train, Z_train)
+    with warnings.catch_warnings():
+        # Les codes latents sont déterministes (sortie de l'encodeur) : il n'y a pas de
+        # bruit à modéliser, et le bruit appris par le WhiteKernel tombe toujours à sa
+        # borne basse. scikit-learn le signale par un ConvergenceWarning attendu (cf. Q2.2),
+        # qu'on masque ici. Seul ce cas est filtré : les autres alertes de convergence
+        # (longueurs caractéristiques, borne haute du bruit) restent affichées.
+        warnings.filterwarnings('ignore', category=ConvergenceWarning,
+                                message=r'.*noise_level is close to the specified lower bound')
+        gpr.fit(X_train, Z_train)
     gpr.fit_time_ = time.perf_counter() - t0
     return gpr
 
@@ -151,3 +161,28 @@ def evaluate_gpr(reducer, X_train, y_train, X_test, y_test, kernel_name="RBF",
         'temps GPR (s)': gpr.fit_time_,
     }
     return gpr, record, errors
+
+def predict_curves_with_band(gpr, decoder, X, n_samples=300, level=0.95, seed=0):
+    """Courbes prédites par le méta-modèle + bande de confiance issue de l'incertitude de la GPR.
+
+    On tire n_samples codes z ~ N(moyenne, écart-type^2) donnés par la GPR, on les
+    décode, et on prend les quantiles des courbes obtenues point par point.
+
+    Returns
+    -------
+    y_pred : (n, M) courbes décodées depuis le code moyen prédit
+    y_lo, y_hi : (n, M) bornes basse et haute de la bande
+    """
+    X = np.atleast_2d(X)
+    z_mean, z_std = gpr.predict(X, return_std=True)
+    z_mean = np.asarray(z_mean).reshape(len(X), -1)
+    z_std = np.asarray(z_std).reshape(z_mean.shape)
+    rng = np.random.default_rng(seed)
+    y_pred = np.asarray(decoder(z_mean))
+    a = (1 - level) / 2
+    y_lo, y_hi = np.empty_like(y_pred), np.empty_like(y_pred)
+    for i in range(len(X)):
+        z_s = z_mean[i] + z_std[i] * rng.standard_normal((n_samples, z_mean.shape[1]))
+        curves = np.asarray(decoder(z_s))
+        y_lo[i], y_hi[i] = np.quantile(curves, [a, 1 - a], axis=0)
+    return y_pred, y_lo, y_hi
